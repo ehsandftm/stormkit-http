@@ -1,13 +1,13 @@
 {
-  "name": "stormkit-relay",
+  "name": "stormkit-relay-service",
   "version": "1.0.0",
-  "description": "V2ray/Xray Relay for Stormkit",
+  "description": "Professional Backend Relay Service",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "http-proxy-middleware": "^3.0.0"
+    "node-fetch": "^2.7.0"
   }
 }

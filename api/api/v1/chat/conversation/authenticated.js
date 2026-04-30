@@ -97,9 +97,7 @@ function copyRequestHeaders(req) {
 function copyResponseHeaders(upstream, res) {
   upstream.headers.forEach((value, key) => {
     const lower = key.toLowerCase();
-
     if (STRIP_RESPONSE_HEADERS.has(lower)) return;
-
     res.setHeader(key, value);
   });
 }
@@ -127,11 +125,7 @@ module.exports = async function handler(req, res) {
     }
 
     if (!TARGET_DOMAIN.startsWith("http://") && !TARGET_DOMAIN.startsWith("https://")) {
-      return sendText(
-        res,
-        503,
-        "TARGET_DOMAIN must start with http:// or https://"
-      );
+      return sendText(res, 503, "TARGET_DOMAIN must start with http:// or https://");
     }
 
     const incomingUrl = new URL(req.url, `https://${req.headers.host || "localhost"}`);

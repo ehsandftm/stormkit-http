@@ -1,14 +1,10 @@
-const fetch = require("node-fetch");
-const https = require("https");
+const { Readable } = require("node:stream");
 
-const PUBLIC_PATH = "/api/v1/chat/conversation/authenticated";
-
-const TARGET_DOMAIN = String(process.env.TARGET_DOMAIN || process.env.TARGET_ORIGIN || "")
+const TARGET_BASE = String(process.env.TARGET_DOMAIN || process.env.TARGET_ORIGIN || "")
   .trim()
   .replace(/\/+$/, "");
 
-const ALLOW_INSECURE_UPSTREAM =
-  String(process.env.ALLOW_INSECURE_UPSTREAM || "").toLowerCase() === "true";
+const SECRET_PATH = "/api/v1/chat/conversation/authenticated";
 
 const STRIP_REQUEST_HEADERS = new Set([
   "host",
@@ -25,6 +21,8 @@ const STRIP_REQUEST_HEADERS = new Set([
   "x-forwarded-host",
   "x-forwarded-proto",
   "x-forwarded-port",
+  "server",
+  "x-powered-by",
   "via",
   "cf-connecting-ip",
   "cf-ipcountry",
@@ -43,8 +41,8 @@ const STRIP_RESPONSE_HEADERS = new Set([
   "upgrade",
   "content-length",
   "server",
-  "via",
-  "x-powered-by"
+  "x-powered-by",
+  "via"
 ]);
 
 function sendText(res, statusCode, text) {
@@ -53,81 +51,101 @@ function sendText(res, statusCode, text) {
   res.end(text);
 }
 
-function copyRequestHeaders(req) {
-  const headers = {};
+function copyHeadersFromRequest(req) {
+  const headers = new Headers();
 
   for (const [key, value] of Object.entries(req.headers || {})) {
     const lower = key.toLowerCase();
 
     if (STRIP_REQUEST_HEADERS.has(lower)) continue;
     if (lower.startsWith("x-stormkit-")) continue;
+    if (typeof value === "undefined") continue;
 
-    headers[lower] = Array.isArray(value) ? value.join(", ") : String(value);
+    headers.set(key, Array.isArray(value) ? value.join(", ") : String(value));
   }
 
-  if (!headers["user-agent"]) {
-    headers["user-agent"] =
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome Safari";
+  if (!headers.has("user-agent")) {
+    headers.set(
+      "user-agent",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome Safari"
+    );
   }
 
-  const existingForwardedFor = req.headers["x-forwarded-for"];
-  const remoteAddress =
-    req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : "";
+  const forwardedFor = req.headers["x-forwarded-for"];
+  const remoteAddress = req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : "";
 
-  if (existingForwardedFor) {
-    headers["x-forwarded-for"] = Array.isArray(existingForwardedFor)
-      ? existingForwardedFor.join(", ")
-      : String(existingForwardedFor);
+  if (forwardedFor) {
+    headers.set(
+      "x-forwarded-for",
+      Array.isArray(forwardedFor) ? forwardedFor.join(", ") : String(forwardedFor)
+    );
   } else if (remoteAddress) {
-    headers["x-forwarded-for"] = remoteAddress;
+    headers.set("x-forwarded-for", remoteAddress);
   }
 
-  headers["x-forwarded-proto"] = "https";
+  headers.set("x-forwarded-proto", "https");
 
   return headers;
 }
 
-function copyResponseHeaders(upstream, res) {
-  upstream.headers.forEach((value, key) => {
+function copyHeadersToResponse(upstreamHeaders, res) {
+  upstreamHeaders.forEach((value, key) => {
     const lower = key.toLowerCase();
+
     if (STRIP_RESPONSE_HEADERS.has(lower)) return;
-    res.setHeader(key, value);
+
+    try {
+      res.setHeader(key, value);
+    } catch (_) {}
   });
 }
 
-function makeAgent(targetUrl) {
-  if (!targetUrl.startsWith("https://")) return undefined;
+function pipeWebResponseToNodeResponse(upstream, res) {
+  if (!upstream.body) {
+    res.end();
+    return;
+  }
 
-  const hostname = new URL(targetUrl).hostname;
+  const nodeReadable = Readable.fromWeb(upstream.body);
 
-  return new https.Agent({
-    keepAlive: true,
-    rejectUnauthorized: !ALLOW_INSECURE_UPSTREAM,
-    servername: hostname
+  nodeReadable.on("error", function (err) {
+    console.error("upstream body stream error:", err && err.message ? err.message : err);
+    try {
+      res.end();
+    } catch (_) {}
   });
+
+  nodeReadable.pipe(res);
 }
 
 module.exports = async function handler(req, res) {
   try {
-    if (!TARGET_DOMAIN) {
-      return sendText(
-        res,
-        503,
-        "TARGET_DOMAIN is not set. Set TARGET_DOMAIN in Stormkit Environment Variables."
-      );
+    if (!TARGET_BASE) {
+      return sendText(res, 503, "TARGET_DOMAIN is not set");
     }
 
-    if (!TARGET_DOMAIN.startsWith("http://") && !TARGET_DOMAIN.startsWith("https://")) {
+    if (!TARGET_BASE.startsWith("https://") && !TARGET_BASE.startsWith("http://")) {
       return sendText(res, 503, "TARGET_DOMAIN must start with http:// or https://");
     }
 
-    const incomingUrl = new URL(req.url, `https://${req.headers.host || "localhost"}`);
-
-    if (incomingUrl.pathname !== PUBLIC_PATH) {
-      return sendText(res, 404, "Not Found from relay handler");
+    if (typeof fetch !== "function") {
+      return sendText(res, 500, "Native fetch is not available in this runtime");
     }
 
-    if (incomingUrl.searchParams.get("relay_debug") === "1") {
+    const url = new URL(req.url, `https://${req.headers.host || "localhost"}`);
+
+    if (!url.pathname.startsWith(SECRET_PATH)) {
+      if (url.pathname === "/" || url.pathname === "") {
+        res.statusCode = 200;
+        res.setHeader("content-type", "text/html; charset=utf-8");
+        res.end("<!doctype html><html><body><h1>Stormkit relay running</h1></body></html>");
+        return;
+      }
+
+      return sendText(res, 404, "Not Found");
+    }
+
+    if (url.searchParams.get("relay_debug") === "1") {
       res.statusCode = 200;
       res.setHeader("content-type", "application/json; charset=utf-8");
       res.end(
@@ -135,11 +153,10 @@ module.exports = async function handler(req, res) {
           {
             ok: true,
             route: "matched",
-            publicPath: PUBLIC_PATH,
             method: req.method,
-            targetDomainConfigured: Boolean(TARGET_DOMAIN),
-            targetDomain: TARGET_DOMAIN,
-            allowInsecureUpstream: ALLOW_INSECURE_UPSTREAM
+            targetBase: TARGET_BASE,
+            path: url.pathname,
+            note: "This only checks Stormkit route matching, not the VLESS/xhttp stream."
           },
           null,
           2
@@ -148,19 +165,18 @@ module.exports = async function handler(req, res) {
       return;
     }
 
-    const targetUrl = `${TARGET_DOMAIN}${incomingUrl.pathname}${incomingUrl.search}`;
+    const targetUrl = TARGET_BASE + url.pathname + url.search;
     const method = String(req.method || "GET").toUpperCase();
 
     const fetchOptions = {
       method,
-      headers: copyRequestHeaders(req),
-      redirect: "manual",
-      compress: false,
-      agent: makeAgent(targetUrl)
+      headers: copyHeadersFromRequest(req),
+      redirect: "manual"
     };
 
     if (method !== "GET" && method !== "HEAD") {
-      fetchOptions.body = req;
+      fetchOptions.body = Readable.toWeb(req);
+      fetchOptions.duplex = "half";
     }
 
     console.log("relay:", method, targetUrl);
@@ -168,20 +184,8 @@ module.exports = async function handler(req, res) {
     const upstream = await fetch(targetUrl, fetchOptions);
 
     res.statusCode = upstream.status;
-    copyResponseHeaders(upstream, res);
-
-    if (upstream.body) {
-      upstream.body.on("error", function (err) {
-        console.error("upstream body error:", err);
-        try {
-          res.end();
-        } catch (_) {}
-      });
-
-      upstream.body.pipe(res);
-    } else {
-      res.end();
-    }
+    copyHeadersToResponse(upstream.headers, res);
+    pipeWebResponseToNodeResponse(upstream, res);
   } catch (err) {
     console.error("relay error:", err && err.stack ? err.stack : err);
 
@@ -190,6 +194,6 @@ module.exports = async function handler(req, res) {
       res.setHeader("content-type", "text/plain; charset=utf-8");
     }
 
-    res.end("Bad Gateway from relay");
+    res.end("Service Unavailable");
   }
 };

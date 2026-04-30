@@ -1,13 +1,12 @@
 {
   "name": "stormkit-relay-service",
   "version": "1.0.0",
-  "description": "Professional Backend Relay Service",
-  "main": "index.js",
+  "description": "Stormkit API relay service",
+  "private": true,
   "scripts": {
-    "start": "node index.js"
+    "start": "node -e \"console.log('This project runs as Stormkit API Functions (no express listen).')\""
   },
   "dependencies": {
-    "express": "^4.19.2",
     "node-fetch": "^2.7.0"
   }
 }

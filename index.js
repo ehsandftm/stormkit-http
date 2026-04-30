@@ -1,87 +1,157 @@
-const express = require('express');
-const fetch = require('node-fetch');
+import express from "express";
+import fetch from "node-fetch";
+
 const app = express();
 
-// خواندن دامین هدف از تنظیمات پنل استورم‌کیت
-const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
+// --- Config ---
+const PORT = process.env.PORT || 3000;
+
+// Your upstream target (must be set in Stormkit env vars)
+const TARGET_DOMAIN = process.env.TARGET_DOMAIN;
+
+// This is the only path that is allowed to be proxied (as in your current code)
 const SECRET_PATH = "/api/v1/chat/conversation/authenticated";
 
-// لیست سیاه هدرها (دقیقاً مطابق نسخه نیتلیفای شما)
-const STRIP_HEADERS = new Set([
-  "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-  "te", "trailer", "transfer-encoding", "upgrade", "forwarded",
-  "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
-  "server", "via"
-]);
+// --- Helpers ---
+function normalizeTarget(target) {
+  // Ensure TARGET_DOMAIN exists and does not end with slash
+  if (!target || typeof target !== "string") return null;
+  return target.endsWith("/") ? target.slice(0, -1) : target;
+}
 
-app.all('*', async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+const NORMALIZED_TARGET = normalizeTarget(TARGET_DOMAIN);
 
-  // ۱. چک کردن تنظیم بودن دامین هدف
-  if (!TARGET_BASE) {
-    return res.status(503).send("Service Unavailable: TARGET_DOMAIN not set.");
-  }
+function buildUpstreamUrl(req) {
+  // Full requested URL (path + query)
+  const incomingUrl = new URL(req.originalUrl, `http://${req.headers.host || "localhost"}`);
 
-  // ۲. مدیریت مسیرها (فقط مسیر خاص ریلای شود)
-  if (!url.pathname.startsWith(SECRET_PATH)) {
-    if (url.pathname === "/" || url.pathname === "") {
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      return res.status(200).send(`<html><head><title>Chat Service</title></head><body><h1>Service is running</h1></body></html>`);
-    }
-    return res.status(404).send("Not Found");
-  }
+  // IMPORTANT:
+  // We keep the incoming path/query exactly and just swap the origin to TARGET_DOMAIN.
+  // Example: https://fr2...:8080 + /api/v1/... ?x=1
+  const upstream = new URL(NORMALIZED_TARGET + incomingUrl.pathname + incomingUrl.search);
+  return upstream.toString();
+}
 
+function pickHeaders(req) {
+  // Forward most headers, but remove hop-by-hop / unsafe ones.
+  const headers = { ...req.headers };
+
+  // These can cause issues when proxying
+  delete headers.host;
+  delete headers.connection;
+  delete headers["content-length"];
+  delete headers["accept-encoding"]; // avoid gzip/br complications, let node-fetch handle
+  delete headers["if-none-match"];
+  delete headers["if-modified-since"];
+
+  return headers;
+}
+
+// --- Middlewares ---
+app.use(express.json({ limit: "25mb" }));
+app.use(express.urlencoded({ extended: true, limit: "25mb" }));
+
+// Basic access log for debugging (Stormkit runtime logs)
+app.use((req, res, next) => {
+  console.log("REQ", req.method, req.url);
+  next();
+});
+
+// --- Health & platform routes (prevent Stormkit from showing 404/unhealthy) ---
+app.get("/", (req, res) => {
+  res.status(200).send("Service is running");
+});
+
+app.get("/healthz", (req, res) => {
+  res.status(200).send("ok");
+});
+
+app.get("/favicon.ico", (req, res) => {
+  // No favicon, but return a valid response
+  res.status(204).end();
+});
+
+// --- Main proxy handler ---
+app.all("*", async (req, res) => {
   try {
-    const targetUrl = TARGET_BASE + url.pathname + url.search;
+    if (!NORMALIZED_TARGET) {
+      return res.status(500).send("TARGET_DOMAIN is not set");
+    }
 
-    // ۳. آماده‌سازی هدرها و پاک‌سازی هدرهای ممنوعه
-    const headers = {};
-    const clientIp = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+    const incomingUrl = new URL(req.originalUrl, `http://${req.headers.host || "localhost"}`);
+    const path = incomingUrl.pathname;
 
-    Object.keys(req.headers).forEach(key => {
-      const k = key.toLowerCase();
-      if (STRIP_HEADERS.has(k) || k.startsWith('x-stormkit-')) return;
-
-      if (k === "user-agent") {
-        headers[k] = req.headers[key] || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
-      } else {
-        headers[key] = req.headers[key];
+    // Allow GETs that Stormkit or browsers might do, so you don't see 404 in dashboard
+    // But do NOT proxy them upstream unless they match SECRET_PATH.
+    if (!path.startsWith(SECRET_PATH)) {
+      // Return 200 for simple GET requests (platform checks, browser, etc.)
+      if (req.method === "GET") {
+        // If you prefer strict mode, change this to 404.
+        return res.status(200).send("OK");
       }
+      return res.status(404).send("Not Found");
+    }
+
+    // Build upstream URL
+    const upstreamUrl = buildUpstreamUrl(req);
+
+    // Prepare body
+    const method = req.method.toUpperCase();
+    const headers = pickHeaders(req);
+
+    let body = undefined;
+
+    // Only attach body for methods that can have it
+    if (method !== "GET" && method !== "HEAD") {
+      // If content-type is JSON or urlencoded, express has parsed it. Re-serialize.
+      // If it's something else, fallback to raw handling is not present here (same as your code).
+      if (req.is("application/json")) {
+        body = JSON.stringify(req.body ?? {});
+        headers["content-type"] = "application/json";
+      } else if (req.is("application/x-www-form-urlencoded")) {
+        const params = new URLSearchParams(req.body).toString();
+        body = params;
+        headers["content-type"] = "application/x-www-form-urlencoded";
+      } else {
+        // Best effort: if body is already object, stringify; otherwise send as-is
+        // (If you need true raw streaming for binary/multipart, tell me تا برات دقیقش کنم)
+        body = typeof req.body === "string" ? req.body : JSON.stringify(req.body ?? {});
+      }
+    }
+
+    console.log("PROXY ->", method, upstreamUrl);
+
+    const upstreamResp = await fetch(upstreamUrl, {
+      method,
+      headers,
+      body,
+      redirect: "manual",
     });
 
-    if (clientIp) headers["x-forwarded-for"] = clientIp;
-    headers["x-forwarded-proto"] = "https";
+    // Copy status
+    res.status(upstreamResp.status);
 
-    // ۴. ارسال درخواست به سرور آمازون
-    const fetchOptions = {
-      method: req.method,
-      headers: headers,
-      redirect: "manual",
-    };
-
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      fetchOptions.body = req; // در نود جی‌اس درخواست خودش یک استریم است
-    }
-
-    const upstream = await fetch(targetUrl, fetchOptions);
-
-    // ۵. کپی کردن هدرهای پاسخ و پاک‌سازی هدرهای حساس سرور
-    upstream.headers.forEach((value, key) => {
+    // Copy headers (careful with some hop-by-hop)
+    upstreamResp.headers.forEach((value, key) => {
       const k = key.toLowerCase();
-      if (['server', 'x-powered-by', 'via', 'transfer-encoding'].includes(k)) return;
+      if (k === "transfer-encoding") return;
+      if (k === "content-encoding") return;
+      if (k === "content-length") return;
       res.setHeader(key, value);
     });
 
-    res.status(upstream.status);
-    upstream.body.pipe(res); // استریم کردن پاسخ برای سرعت بالاتر
-
-  } catch (error) {
-    console.error("Relay error:", error);
-    res.status(502).send("Service Unavailable");
+    // Pipe body
+    const buffer = Buffer.from(await upstreamResp.arrayBuffer());
+    return res.send(buffer);
+  } catch (err) {
+    console.error("ERROR:", err);
+    return res.status(500).send("Internal Server Error");
   }
 });
 
-const PORT = process.env.PORT || 3000;
+// --- Start server ---
 app.listen(PORT, () => {
-  console.log(`Professional Relay targeting: ${TARGET_BASE}`);
+  console.log(`Listening on port ${PORT}`);
+  console.log("TARGET_DOMAIN:", NORMALIZED_TARGET || "(not set)");
+  console.log("SECRET_PATH:", SECRET_PATH);
 });

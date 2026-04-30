@@ -1,12 +1,16 @@
 {
-  "name": "stormkit-relay-service",
+  "name": "stormkit-http",
   "version": "1.0.0",
-  "description": "Stormkit API relay service",
   "private": true,
+  "description": "Stormkit HTTP relay",
   "scripts": {
-    "start": "node -e \"console.log('This project runs as Stormkit API Functions (no express listen).')\""
+    "build": "echo build-ok",
+    "start": "echo stormkit-functions"
   },
   "dependencies": {
-    "node-fetch": "^2.7.0"
+    "node-fetch": "2.7.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

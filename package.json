@@ -1,8 +1,8 @@
 {
-  "name": "stormkit-http",
+  "name": "stormkit-relay-service",
   "version": "1.0.0",
+  "description": "Stormkit API relay service",
   "private": true,
-  "description": "Stormkit HTTP relay",
   "scripts": {
     "build": "echo build-ok",
     "start": "echo stormkit-functions"
